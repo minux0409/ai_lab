@@ -1,7 +1,8 @@
+import numpy as np
 from stable_baselines3 import PPO
 
-from partial_obstacle_map_reward_env import (
-    PartialObstacleMapRewardEnv,
+from partial_obstacle_goal1000_history_env import (
+    PartialObstacleGoal1000HistoryEnv,
 )
 
 
@@ -14,96 +15,23 @@ CHECKPOINTS = [
     200_000,
 ]
 
-
-def evaluate_random(episodes=500):
-    env = PartialObstacleMapRewardEnv()
-
-    success = 0
-
-    success_steps = []
-    failure_steps = []
-
-    for episode in range(episodes):
-        obs, _ = env.reset(
-            seed=10_000 + episode
-        )
-
-        steps = 0
-
-        while True:
-            action = (
-                env.action_space.sample()
-            )
-
-            (
-                obs,
-                reward,
-                terminated,
-                truncated,
-                _,
-            ) = env.step(action)
-
-            steps += 1
-
-            if terminated or truncated:
-                if terminated:
-                    success += 1
-                    success_steps.append(
-                        steps
-                    )
-                else:
-                    failure_steps.append(
-                        steps
-                    )
-
-                break
-
-    env.close()
-
-    success_rate = (
-        success
-        / episodes
-        * 100
-    )
-
-    success_avg_steps = (
-        sum(success_steps)
-        / len(success_steps)
-        if success_steps
-        else 0.0
-    )
-
-    failure_avg_steps = (
-        sum(failure_steps)
-        / len(failure_steps)
-        if failure_steps
-        else 0.0
-    )
-
-    return (
-        success_rate,
-        success_avg_steps,
-        failure_avg_steps,
-    )
+EVAL_EPISODES = 500
+EVAL_SEED_BASE = 10_000
 
 
-def evaluate(
+def evaluate_model(
     model,
-    episodes=500,
+    episodes=EVAL_EPISODES,
 ):
-    env = PartialObstacleMapRewardEnv()
+    env = PartialObstacleGoal1000HistoryEnv()
 
     success = 0
-
     success_steps = []
     failure_steps = []
 
     for episode in range(episodes):
-
-        # 모든 Checkpoint를
-        # 동일한 500개 맵으로 평가
         obs, _ = env.reset(
-            seed=10_000 + episode
+            seed=EVAL_SEED_BASE + episode
         )
 
         steps = 0
@@ -127,11 +55,9 @@ def evaluate(
             if terminated or truncated:
                 if terminated:
                     success += 1
-
                     success_steps.append(
                         steps
                     )
-
                 else:
                     failure_steps.append(
                         steps
@@ -142,21 +68,94 @@ def evaluate(
     env.close()
 
     success_rate = (
-        success
-        / episodes
-        * 100
+        success / episodes * 100.0
     )
 
     success_avg_steps = (
-        sum(success_steps)
-        / len(success_steps)
+        float(np.mean(success_steps))
         if success_steps
         else 0.0
     )
 
     failure_avg_steps = (
-        sum(failure_steps)
-        / len(failure_steps)
+        float(np.mean(failure_steps))
+        if failure_steps
+        else 0.0
+    )
+
+    return (
+        success_rate,
+        success_avg_steps,
+        failure_avg_steps,
+    )
+
+
+def evaluate_random(
+    episodes=EVAL_EPISODES,
+):
+    env = PartialObstacleGoal1000HistoryEnv()
+
+    success = 0
+    success_steps = []
+    failure_steps = []
+
+    for episode in range(episodes):
+        obs, _ = env.reset(
+            seed=EVAL_SEED_BASE + episode
+        )
+
+        # Random action도 episode별 고정
+        rng = np.random.default_rng(
+            20_000 + episode
+        )
+
+        steps = 0
+
+        while True:
+            action = int(
+                rng.integers(
+                    0,
+                    env.action_space.n,
+                )
+            )
+
+            (
+                obs,
+                reward,
+                terminated,
+                truncated,
+                _,
+            ) = env.step(action)
+
+            steps += 1
+
+            if terminated or truncated:
+                if terminated:
+                    success += 1
+                    success_steps.append(
+                        steps
+                    )
+                else:
+                    failure_steps.append(
+                        steps
+                    )
+
+                break
+
+    env.close()
+
+    success_rate = (
+        success / episodes * 100.0
+    )
+
+    success_avg_steps = (
+        float(np.mean(success_steps))
+        if success_steps
+        else 0.0
+    )
+
+    failure_avg_steps = (
+        float(np.mean(failure_steps))
         if failure_steps
         else 0.0
     )
@@ -169,58 +168,40 @@ def evaluate(
 
 
 if __name__ == "__main__":
-
-    # -------------------------------------------------
-    # 실제 환경 설정값 확인
-    # -------------------------------------------------
-    config_env = (
-        PartialObstacleMapRewardEnv()
+    test_env = (
+        PartialObstacleGoal1000HistoryEnv()
     )
 
     print(
-        "=== Goal Tile Reward Experiment ==="
+        "=== Goal1000 History "
+        "Controlled Experiment ==="
     )
 
     print()
-    print("Observation       : 94")
-    print("  Local 3x3       : 9")
-    print("  Goal dx/dy      : 2")
-    print("  Discovered map  : 81")
-    print("  Agent x/y       : 2")
+    print(
+        "Observation:",
+        test_env.observation_space.shape,
+    )
 
     print()
-    print(
-        f"Step penalty      : "
-        f"{config_env.step_penalty:+.1f}"
-    )
+    print("변경:")
+    print("  Goal Reward : 100 -> 1000")
+    print("  Tile Reward : distance 1=15")
+    print()
+    print("유지:")
+    print("  History     : 기존 그대로")
+    print("  Observation : 107")
+    print("  Visit Count : 없음")
+    print("  Collision   : -1")
+    print("  Revisit     : 0")
 
-    print(
-        f"Discovery reward  : "
-        f"{config_env.discovery_reward:+.1f}"
-    )
+    test_env.close()
 
-    print(
-        f"Collision penalty : "
-        f"{config_env.collision_penalty:+.1f}"
-    )
-
-    print(
-        "Tile reward       : "
-        "first visit only, "
-        "max(1, 9-distance)"
-    )
-
-    print(
-        f"Goal reward       : "
-        f"{config_env.goal_reward:+.1f}"
-    )
-
-    config_env.close()
-
-    # -------------------------------------------------
-    # Random Agent
-    # -------------------------------------------------
-    print("\n=== Random Agent ===")
+    # ---------------------------------------------
+    # Random
+    # ---------------------------------------------
+    print()
+    print("Random 평가 중...")
 
     (
         random_success,
@@ -229,6 +210,7 @@ if __name__ == "__main__":
     ) = evaluate_random()
 
     print(
+        f"Random | "
         f"Success "
         f"{random_success:.1f}% | "
         f"Success Steps "
@@ -237,11 +219,11 @@ if __name__ == "__main__":
         f"{random_failure_steps:.2f}"
     )
 
-    # -------------------------------------------------
+    # ---------------------------------------------
     # PPO
-    # -------------------------------------------------
+    # ---------------------------------------------
     train_env = (
-        PartialObstacleMapRewardEnv()
+        PartialObstacleGoal1000HistoryEnv()
     )
 
     model = PPO(
@@ -252,8 +234,8 @@ if __name__ == "__main__":
         seed=42,
     )
 
-    previous_checkpoint = 0
     results = []
+    previous_checkpoint = 0
 
     for checkpoint in CHECKPOINTS:
         additional_steps = (
@@ -262,32 +244,31 @@ if __name__ == "__main__":
         )
 
         if additional_steps > 0:
+            print()
             print(
-                f"\n"
-                f"{previous_checkpoint:,} → "
+                f"{previous_checkpoint:,} "
+                f"-> "
                 f"{checkpoint:,} "
                 f"timestep 학습..."
             )
 
             model.learn(
-                total_timesteps=(
-                    additional_steps
-                ),
+                total_timesteps=additional_steps,
                 reset_num_timesteps=False,
             )
 
         (
             success_rate,
-            success_avg_steps,
-            failure_avg_steps,
-        ) = evaluate(model)
+            success_steps,
+            failure_steps,
+        ) = evaluate_model(model)
 
         results.append(
             (
                 checkpoint,
                 success_rate,
-                success_avg_steps,
-                failure_avg_steps,
+                success_steps,
+                failure_steps,
             )
         )
 
@@ -296,31 +277,31 @@ if __name__ == "__main__":
             f"Success "
             f"{success_rate:.1f}% | "
             f"Success Steps "
-            f"{success_avg_steps:.2f} | "
+            f"{success_steps:.2f} | "
             f"Failure Steps "
-            f"{failure_avg_steps:.2f}"
+            f"{failure_steps:.2f}"
         )
 
-        previous_checkpoint = (
-            checkpoint
-        )
+        previous_checkpoint = checkpoint
 
-    # -------------------------------------------------
-    # 이번 실험 모델은 별도 이름으로 저장
-    # -------------------------------------------------
-    model.save(
+    # ---------------------------------------------
+    # Save
+    # ---------------------------------------------
+    MODEL_PATH = (
         "models/"
-        "partial_obstacle_goal_tile_reward_ppo"
+        "partial_obstacle_"
+        "goal1000_history_ppo"
     )
+
+    model.save(MODEL_PATH)
 
     train_env.close()
 
-    # -------------------------------------------------
-    # 최종 결과
-    # -------------------------------------------------
-    print(
-        "\n=== 전체 학습 결과 ==="
-    )
+    # ---------------------------------------------
+    # Summary
+    # ---------------------------------------------
+    print()
+    print("=== 전체 학습 결과 ===")
 
     print(
         f"Random  | "
@@ -335,24 +316,21 @@ if __name__ == "__main__":
     for (
         checkpoint,
         success_rate,
-        success_avg_steps,
-        failure_avg_steps,
+        success_steps,
+        failure_steps,
     ) in results:
         print(
             f"{checkpoint:>7,} | "
             f"Success "
             f"{success_rate:>5.1f}% | "
             f"Success Steps "
-            f"{success_avg_steps:>6.2f} | "
+            f"{success_steps:>6.2f} | "
             f"Failure Steps "
-            f"{failure_avg_steps:>6.2f}"
+            f"{failure_steps:>6.2f}"
         )
 
     print()
     print(
-        "모델 저장:"
-    )
-    print(
-        "models/"
-        "partial_obstacle_goal_tile_reward_ppo.zip"
+        "모델 저장:",
+        MODEL_PATH + ".zip",
     )

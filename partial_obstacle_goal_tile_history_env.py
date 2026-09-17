@@ -6,7 +6,7 @@ from gymnasium import spaces
 from stable_baselines3.common.env_checker import check_env
 
 
-class PartialObstacleMapRewardEnv(gym.Env):
+class PartialObstacleGoalTileHistoryEnv(gym.Env):
     def __init__(self):
         super().__init__()
 
@@ -16,61 +16,53 @@ class PartialObstacleMapRewardEnv(gym.Env):
 
         # -------------------------------------------------
         # Reward
+        # 이전 Goal Tile Reward 실험과 동일
         # -------------------------------------------------
-        # 일반 이동 자체에는 Reward/Penalty 없음
         self.step_penalty = 0.0
-
-        # 지도 발견 자체에는 Reward 없음
         self.discovery_reward = 0.0
-
-        # 벽 또는 맵 밖으로 이동 시도
         self.collision_penalty = -1.0
-
-        # Goal 도착
         self.goal_reward = 100.0
-
-        # 최초 방문 타일의 거리 기반 Reward 최대 기준값
-        #
-        # tile_reward = max(
-        #     1,
-        #     tile_reward_max - Manhattan Distance
-        # )
-        #
-        # Goal 자체는 별도로 +100을 지급하므로
-        # 일반 타일에 대해서만 적용한다.
         self.tile_reward_max = 9.0
+
+        # -------------------------------------------------
+        # History
+        # -------------------------------------------------
+        # 최근 4개 위치를 기억
+        self.history_length = 4
 
         # -------------------------------------------------
         # Action
         # -------------------------------------------------
-        # 0: 위
-        # 1: 아래
-        # 2: 왼쪽
-        # 3: 오른쪽
+        # 0: UP
+        # 1: DOWN
+        # 2: LEFT
+        # 3: RIGHT
         self.action_space = spaces.Discrete(4)
 
         # -------------------------------------------------
         # Observation
+        #
+        # 기존:
+        # Local 3x3        9
+        # Goal dx/dy       2
+        # Discovered Map  81
+        # Agent x/y        2
+        # ------------------
+        #                  94
+        #
+        # 추가:
+        # Last Action      4 (one-hot)
+        # Last Collision   1
+        # Position History 8 (4 positions x/y)
+        # ------------------
+        # 총              107
         # -------------------------------------------------
-        #
-        # 현재 주변 3x3              = 9
-        # Goal 상대 위치 dx, dy      = 2
-        # 누적 발견 지도 9x9         = 81
-        # 현재 Agent 절대 위치 x, y  = 2
-        #
-        # 총 94
-        #
-        # 누적 지도:
-        # -1 = 아직 관측하지 못함
-        #  0 = 관측된 이동 가능 칸
-        #  1 = 관측된 장애물
-        #
-        # Agent x/y:
-        # 0 ~ 8 좌표를 0 ~ 1로 정규화
+        self.observation_size = 107
+
         self.observation_space = spaces.Box(
             low=-1.0,
             high=1.0,
-            shape=(94,),
+            shape=(self.observation_size,),
             dtype=np.float32,
         )
 
@@ -80,15 +72,18 @@ class PartialObstacleMapRewardEnv(gym.Env):
 
         self.steps = 0
 
-        # PPO에게 전달되는 누적 발견 지도
         self.discovered_map = None
-
-        # Reward 계산용 방문 위치 기록
-        #
-        # PPO Observation에는 직접 추가하지 않는다.
-        # 같은 타일의 Reward를 반복해서 받지 못하게 하기 위한
-        # 환경 내부 상태다.
         self.visited_positions = None
+
+        # 직전 행동
+        # reset 직후에는 행동이 없으므로 None
+        self.last_action = None
+
+        # 직전 행동이 충돌했는지
+        self.last_collision = False
+
+        # 최근 위치 4개
+        self.position_history = None
 
     def _random_position(self):
         return np.array(
@@ -107,15 +102,21 @@ class PartialObstacleMapRewardEnv(gym.Env):
 
     def _is_path_available(self):
         """
-        맵 생성 시 실제 Agent -> Goal 경로가 존재하는지
-        BFS로 검사한다.
+        랜덤 생성된 맵에서
+        Start -> Goal 경로가 실제 존재하는지 BFS 검사.
 
-        해결 가능한 맵만 생성하기 위한 용도이며,
-        실제 전체 경로 정보는 PPO에게 제공하지 않는다.
+        PPO에게 전체 경로나 BFS 결과는 제공하지 않는다.
         """
 
-        start = tuple(self.agent_pos)
-        goal = tuple(self.goal_pos)
+        start = tuple(
+            int(v)
+            for v in self.agent_pos
+        )
+
+        goal = tuple(
+            int(v)
+            for v in self.goal_pos
+        )
 
         queue = deque([start])
         visited = {start}
@@ -158,17 +159,13 @@ class PartialObstacleMapRewardEnv(gym.Env):
 
     def _update_discovered_map(self):
         """
-        현재 Agent 위치 기준 주변 3x3을 관측하여
-        누적 발견 지도에 기록한다.
+        현재 위치 주변 3x3을 누적 지도에 기록.
 
-        반환값:
-            이번 관측에서 새롭게 밝혀진 맵 내부 칸 수
+        -1 = Unknown
+         0 = Free
+         1 = Obstacle
 
-        장애물도 처음 관측했다면 새로운 정보이므로
-        새로 발견한 칸으로 계산한다.
-
-        단, 이번 실험에서는 새 칸 발견 자체에는
-        Reward를 지급하지 않는다.
+        이번 실험에서는 발견 자체에 Reward 없음.
         """
 
         ax, ay = self.agent_pos
@@ -180,14 +177,12 @@ class PartialObstacleMapRewardEnv(gym.Env):
                 x = ax + dx
                 y = ay + dy
 
-                # 맵 바깥은 발견 칸으로 계산하지 않음
                 if not (
                     0 <= x < self.grid_size
                     and 0 <= y < self.grid_size
                 ):
                     continue
 
-                # 아직 한 번도 관측하지 않은 칸
                 if self.discovered_map[y, x] == -1.0:
                     newly_discovered += 1
 
@@ -198,13 +193,93 @@ class PartialObstacleMapRewardEnv(gym.Env):
 
         return newly_discovered
 
+    def _get_tile_reward(self):
+        """
+        처음 방문한 일반 타일에 지급하는
+        Goal Manhattan Distance 기반 Reward.
+
+        distance 1 -> +8
+        distance 2 -> +7
+        ...
+        distance >= 8 -> +1
+
+        Goal은 별도로 +100.
+        """
+
+        ax, ay = self.agent_pos
+        gx, gy = self.goal_pos
+
+        manhattan_distance = (
+            abs(int(gx) - int(ax))
+            + abs(int(gy) - int(ay))
+        )
+
+        return float(
+            max(
+                1.0,
+                self.tile_reward_max
+                - manhattan_distance,
+            )
+        )
+
+    def _get_last_action_one_hot(self):
+        """
+        직전 Action을 one-hot으로 반환.
+
+        reset 직후:
+        [0, 0, 0, 0]
+
+        예: 직전 Action RIGHT(3)
+        [0, 0, 0, 1]
+        """
+
+        one_hot = np.zeros(
+            4,
+            dtype=np.float32,
+        )
+
+        if self.last_action is not None:
+            one_hot[
+                int(self.last_action)
+            ] = 1.0
+
+        return one_hot.tolist()
+
+    def _get_position_history_observation(self):
+        """
+        최근 4개 위치를 x/y 정규화하여 반환.
+
+        예:
+        [
+            x1, y1,
+            x2, y2,
+            x3, y3,
+            x4, y4
+        ]
+
+        좌표 0~8 -> 0~1
+        """
+
+        values = []
+
+        for x, y in self.position_history:
+            values.append(
+                x / (self.grid_size - 1)
+            )
+
+            values.append(
+                y / (self.grid_size - 1)
+            )
+
+        return values
+
     def _get_observation(self):
         ax, ay = self.agent_pos
 
         local_cells = []
 
         # -------------------------------------------------
-        # 1. 현재 주변 3x3 = 9
+        # 1. Local 3x3 = 9
         # -------------------------------------------------
         for dy in [-1, 0, 1]:
             for dx in [-1, 0, 1]:
@@ -217,19 +292,16 @@ class PartialObstacleMapRewardEnv(gym.Env):
                     or y < 0
                     or y >= self.grid_size
                 ):
-                    # 맵 바깥
                     local_cells.append(-1.0)
 
                 elif self.grid[y, x] == 1:
-                    # 장애물
                     local_cells.append(1.0)
 
                 else:
-                    # 이동 가능
                     local_cells.append(0.0)
 
         # -------------------------------------------------
-        # 2. Goal 상대 위치 = 2
+        # 2. Goal dx/dy = 2
         # -------------------------------------------------
         goal_dx = (
             self.goal_pos[0]
@@ -242,7 +314,7 @@ class PartialObstacleMapRewardEnv(gym.Env):
         ) / (self.grid_size - 1)
 
         # -------------------------------------------------
-        # 3. 누적 발견 지도 = 81
+        # 3. Discovered Map = 81
         # -------------------------------------------------
         discovered_flat = (
             self.discovered_map
@@ -251,7 +323,7 @@ class PartialObstacleMapRewardEnv(gym.Env):
         )
 
         # -------------------------------------------------
-        # 4. 현재 Agent 절대 위치 = 2
+        # 4. Current Agent x/y = 2
         # -------------------------------------------------
         agent_x = (
             self.agent_pos[0]
@@ -263,57 +335,58 @@ class PartialObstacleMapRewardEnv(gym.Env):
             / (self.grid_size - 1)
         )
 
-        # 총 94개
+        # -------------------------------------------------
+        # 5. Last Action = 4
+        # -------------------------------------------------
+        last_action_one_hot = (
+            self._get_last_action_one_hot()
+        )
+
+        # -------------------------------------------------
+        # 6. Last Collision = 1
+        # -------------------------------------------------
+        last_collision = (
+            1.0
+            if self.last_collision
+            else 0.0
+        )
+
+        # -------------------------------------------------
+        # 7. Position History = 8
+        # -------------------------------------------------
+        position_history = (
+            self._get_position_history_observation()
+        )
+
         observation = np.array(
             local_cells
             + [goal_dx, goal_dy]
             + discovered_flat
-            + [agent_x, agent_y],
+            + [agent_x, agent_y]
+            + last_action_one_hot
+            + [last_collision]
+            + position_history,
             dtype=np.float32,
+        )
+
+        assert len(observation) == 107, (
+            f"Observation 길이 오류: "
+            f"{len(observation)}"
         )
 
         return observation
 
-    def _get_tile_reward(self):
-        """
-        현재 Agent 위치의 Goal 거리 기반 타일 Reward.
-
-        Goal에 가까울수록 큰 값.
-
-        예:
-        거리 1 -> +8
-        거리 2 -> +7
-        거리 3 -> +6
-        ...
-        거리 8 이상 -> +1
-
-        Goal 자체는 이 Reward를 사용하지 않고
-        별도로 +100을 지급한다.
-        """
-
-        ax, ay = self.agent_pos
-        gx, gy = self.goal_pos
-
-        manhattan_distance = (
-            abs(int(gx) - int(ax))
-            + abs(int(gy) - int(ay))
-        )
-
-        tile_reward = max(
-            1.0,
-            self.tile_reward_max
-            - manhattan_distance,
-        )
-
-        return float(tile_reward)
-
-    def reset(self, seed=None, options=None):
+    def reset(
+        self,
+        seed=None,
+        options=None,
+    ):
         super().reset(seed=seed)
 
         self.steps = 0
 
         # -------------------------------------------------
-        # 반드시 실제 경로가 존재하는 랜덤 맵 생성
+        # 해결 가능한 랜덤 맵 생성
         # -------------------------------------------------
         while True:
             self.grid = (
@@ -326,8 +399,13 @@ class PartialObstacleMapRewardEnv(gym.Env):
                 < self.obstacle_probability
             ).astype(np.int32)
 
-            self.agent_pos = self._random_position()
-            self.goal_pos = self._random_position()
+            self.agent_pos = (
+                self._random_position()
+            )
+
+            self.goal_pos = (
+                self._random_position()
+            )
 
             if np.array_equal(
                 self.agent_pos,
@@ -338,16 +416,14 @@ class PartialObstacleMapRewardEnv(gym.Env):
             ax, ay = self.agent_pos
             gx, gy = self.goal_pos
 
-            # 시작점과 Goal은 항상 이동 가능
             self.grid[ay, ax] = 0
             self.grid[gy, gx] = 0
 
-            # 해결 가능한 맵만 사용
             if self._is_path_available():
                 break
 
         # -------------------------------------------------
-        # 누적 지도 초기화
+        # Discovered Map 초기화
         # -------------------------------------------------
         self.discovered_map = np.full(
             (
@@ -358,36 +434,53 @@ class PartialObstacleMapRewardEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # 시작 위치에서 보이는 주변 3x3은
-        # 처음부터 관측한 상태로 시작한다.
-        #
-        # 시작 Observation이므로 발견 Reward 없음.
         self._update_discovered_map()
 
         # -------------------------------------------------
-        # 방문 위치 초기화
+        # 최초 방문 Reward 기록
         # -------------------------------------------------
-        # 시작 위치는 이미 방문한 것으로 처리한다.
-        #
-        # 따라서 시작 위치 자체의 타일 Reward는
-        # 지급하지 않는다.
+        start_position = tuple(
+            int(v)
+            for v in self.agent_pos
+        )
+
         self.visited_positions = {
-            tuple(
-                int(v)
-                for v in self.agent_pos
-            )
+            start_position
         }
 
-        return self._get_observation(), {}
+        # -------------------------------------------------
+        # History 초기화
+        # -------------------------------------------------
+        self.last_action = None
+        self.last_collision = False
+
+        # 아직 과거 위치가 없으므로
+        # 시작 위치로 4칸 모두 채운다.
+        self.position_history = deque(
+            [
+                start_position
+                for _ in range(
+                    self.history_length
+                )
+            ],
+            maxlen=self.history_length,
+        )
+
+        return (
+            self._get_observation(),
+            {},
+        )
 
     def step(self, action):
         self.steps += 1
+
+        action = int(action)
 
         old_pos = self.agent_pos.copy()
         new_pos = self.agent_pos.copy()
 
         # -------------------------------------------------
-        # PPO가 선택한 Action 실행
+        # Action
         # -------------------------------------------------
         if action == 0:
             new_pos[1] -= 1
@@ -401,16 +494,11 @@ class PartialObstacleMapRewardEnv(gym.Env):
         elif action == 3:
             new_pos[0] += 1
 
-        # -------------------------------------------------
-        # 기본 Reward
-        # -------------------------------------------------
-        # 이번 실험에서는 Step 자체의 penalty 없음.
         reward = 0.0
-
         collision = False
 
         # -------------------------------------------------
-        # 맵 밖 충돌 검사
+        # Map Out
         # -------------------------------------------------
         if (
             new_pos[0] < 0
@@ -422,7 +510,7 @@ class PartialObstacleMapRewardEnv(gym.Env):
             new_pos = old_pos.copy()
 
         # -------------------------------------------------
-        # 장애물 충돌 검사
+        # Wall
         # -------------------------------------------------
         if not collision:
             nx, ny = new_pos
@@ -432,30 +520,30 @@ class PartialObstacleMapRewardEnv(gym.Env):
                 new_pos = old_pos.copy()
 
         # -------------------------------------------------
-        # 충돌 Reward
+        # Collision Reward
         # -------------------------------------------------
         if collision:
-            reward += self.collision_penalty
+            reward += (
+                self.collision_penalty
+            )
 
         # 실제 위치 반영
         self.agent_pos = new_pos
 
         # -------------------------------------------------
-        # 누적 발견 지도 업데이트
+        # 지도 갱신
         # -------------------------------------------------
-        # 지도는 계속 Observation으로 제공한다.
-        #
-        # 하지만 이번 실험에서는
-        # 새 칸 발견 자체에는 Reward가 없다.
-        newly_discovered = self._update_discovered_map()
+        newly_discovered = (
+            self._update_discovered_map()
+        )
 
         terminated = False
 
-        tile_reward = 0.0
         first_visit = False
+        tile_reward = 0.0
 
         # -------------------------------------------------
-        # Goal 도착
+        # Goal
         # -------------------------------------------------
         if np.array_equal(
             self.agent_pos,
@@ -465,7 +553,7 @@ class PartialObstacleMapRewardEnv(gym.Env):
             terminated = True
 
         # -------------------------------------------------
-        # Goal이 아닌 일반 타일
+        # 처음 방문한 일반 타일
         # -------------------------------------------------
         else:
             current_position = tuple(
@@ -473,9 +561,6 @@ class PartialObstacleMapRewardEnv(gym.Env):
                 for v in self.agent_pos
             )
 
-            # 충돌하지 않았고,
-            # 이번 Episode에서 처음 방문한 타일이면
-            # Goal 거리 기반 Reward 지급
             if (
                 not collision
                 and current_position
@@ -494,7 +579,23 @@ class PartialObstacleMapRewardEnv(gym.Env):
                 )
 
         # -------------------------------------------------
-        # 100 Step 사용 시 실패 종료
+        # ★ 이번 실험의 핵심
+        # Action 결과를 다음 Observation에 기록
+        # -------------------------------------------------
+        self.last_action = action
+        self.last_collision = collision
+
+        current_position = tuple(
+            int(v)
+            for v in self.agent_pos
+        )
+
+        self.position_history.append(
+            current_position
+        )
+
+        # -------------------------------------------------
+        # Max Step
         # -------------------------------------------------
         truncated = (
             self.steps >= self.max_steps
@@ -502,11 +603,13 @@ class PartialObstacleMapRewardEnv(gym.Env):
         )
 
         info = {
-            "newly_discovered": newly_discovered,
+            "newly_discovered":
+                newly_discovered,
 
             "discovered_cells": int(
                 np.sum(
-                    self.discovered_map != -1.0
+                    self.discovered_map
+                    != -1.0
                 )
             ),
 
@@ -518,15 +621,29 @@ class PartialObstacleMapRewardEnv(gym.Env):
                 self.agent_pos[1]
             ),
 
-            "collision": collision,
+            "collision":
+                collision,
 
-            "first_visit": first_visit,
+            "first_visit":
+                first_visit,
 
-            "tile_reward": tile_reward,
+            "tile_reward":
+                tile_reward,
 
             "visited_positions": len(
                 self.visited_positions
             ),
+
+            "last_action":
+                self.last_action,
+
+            "last_collision":
+                self.last_collision,
+
+            "position_history":
+                list(
+                    self.position_history
+                ),
         }
 
         return (
@@ -538,18 +655,16 @@ class PartialObstacleMapRewardEnv(gym.Env):
         )
 
     def render(self):
-        """
-        디버깅용 실제 전체 맵.
-
-        PPO는 이 전체 맵을 볼 수 없다.
-        """
-
         print()
 
-        for y in range(self.grid_size):
+        for y in range(
+            self.grid_size
+        ):
             row = []
 
-            for x in range(self.grid_size):
+            for x in range(
+                self.grid_size
+            ):
                 pos = np.array(
                     [x, y]
                 )
@@ -566,123 +681,25 @@ class PartialObstacleMapRewardEnv(gym.Env):
                 ):
                     row.append("G")
 
-                elif self.grid[y, x] == 1:
+                elif (
+                    self.grid[y, x] == 1
+                ):
                     row.append("#")
 
                 else:
                     row.append(".")
 
-            print(" ".join(row))
-
-        print()
-
-    def render_discovered_map(self):
-        """
-        PPO에게 전달되는 누적 지도를
-        사람이 보기 쉽게 출력한다.
-
-        ? = 아직 모름
-        . = 확인된 이동 가능 칸
-        # = 확인된 장애물
-        A = 현재 Agent 위치
-
-        A는 출력 편의를 위한 표시다.
-        PPO에게는 별도로 agent_x / agent_y가 전달된다.
-        """
-
-        print()
-
-        for y in range(self.grid_size):
-            row = []
-
-            for x in range(self.grid_size):
-                if (
-                    x == self.agent_pos[0]
-                    and y == self.agent_pos[1]
-                ):
-                    row.append("A")
-                    continue
-
-                value = (
-                    self.discovered_map[y, x]
-                )
-
-                if value == -1.0:
-                    row.append("?")
-
-                elif value == 1.0:
-                    row.append("#")
-
-                else:
-                    row.append(".")
-
-            print(" ".join(row))
-
-        print()
-
-    def render_tile_rewards(self):
-        """
-        현재 Goal 기준으로 각 이동 가능 칸이
-        최초 방문 시 받을 수 있는 Tile Reward를 출력한다.
-
-        # = 장애물
-        G = Goal
-        A = 현재 Agent
-
-        이 표 자체는 PPO Observation으로 전달하지 않는다.
-        Reward 계산을 사람이 확인하기 위한 디버깅용이다.
-        """
-
-        print()
-
-        for y in range(self.grid_size):
-            row = []
-
-            for x in range(self.grid_size):
-                if (
-                    x == self.agent_pos[0]
-                    and y == self.agent_pos[1]
-                ):
-                    row.append(" A ")
-                    continue
-
-                if (
-                    x == self.goal_pos[0]
-                    and y == self.goal_pos[1]
-                ):
-                    row.append(" G ")
-                    continue
-
-                if self.grid[y, x] == 1:
-                    row.append(" # ")
-                    continue
-
-                gx, gy = self.goal_pos
-
-                distance = (
-                    abs(int(gx) - x)
-                    + abs(int(gy) - y)
-                )
-
-                value = max(
-                    1,
-                    int(
-                        self.tile_reward_max
-                        - distance
-                    ),
-                )
-
-                row.append(
-                    f"{value:2d} "
-                )
-
-            print("".join(row))
+            print(
+                " ".join(row)
+            )
 
         print()
 
 
 if __name__ == "__main__":
-    env = PartialObstacleMapRewardEnv()
+    env = (
+        PartialObstacleGoalTileHistoryEnv()
+    )
 
     check_env(env)
 
@@ -694,23 +711,41 @@ if __name__ == "__main__":
     )
 
     print()
-    print("=== Reward 설정 ===")
+    print("=== Observation ===")
+    print("Local 3x3        : 9")
+    print("Goal dx/dy       : 2")
+    print("Discovered map   : 81")
+    print("Agent x/y        : 2")
+    print("Last Action      : 4")
+    print("Last Collision   : 1")
+    print("Position History : 8")
+    print("----------------------")
+    print("Total            : 107")
+
+    print()
+    print("=== Reward ===")
+
     print(
         f"Step penalty      : "
         f"{env.step_penalty:+.1f}"
     )
+
     print(
         f"Discovery reward  : "
         f"{env.discovery_reward:+.1f}"
     )
+
     print(
         f"Collision penalty : "
         f"{env.collision_penalty:+.1f}"
     )
+
     print(
         "Tile reward       : "
-        "최초 방문 시 max(1, 9-distance)"
+        "first visit only, "
+        "max(1, 9-distance)"
     )
+
     print(
         f"Goal reward       : "
         f"{env.goal_reward:+.1f}"
@@ -720,45 +755,27 @@ if __name__ == "__main__":
 
     print()
     print(
-        "시작 Observation 길이:",
+        "Observation length:",
         len(obs),
     )
 
     print(
-        "시작 Agent 위치:",
+        "Start:",
         tuple(env.agent_pos),
     )
 
     print(
-        "Goal 위치:",
+        "Goal:",
         tuple(env.goal_pos),
     )
 
-    print(
-        "Observation의 Agent 정규화 위치:",
-        f"x={obs[-2]:.3f},",
-        f"y={obs[-1]:.3f}",
-    )
+    print()
+    print("=== Random 10 Step ===")
 
-    print("\n=== 실제 전체 맵 ===")
-    env.render()
-
-    print(
-        "=== Goal 거리 기반 Tile Reward ==="
-    )
-    env.render_tile_rewards()
-
-    print(
-        "=== PPO가 전달받는 누적 지도 ==="
-    )
-    env.render_discovered_map()
-
-    print(
-        "=== Random Action 5 Step 테스트 ==="
-    )
-
-    for step in range(5):
-        action = env.action_space.sample()
+    for i in range(10):
+        action = (
+            env.action_space.sample()
+        )
 
         (
             obs,
@@ -769,22 +786,27 @@ if __name__ == "__main__":
         ) = env.step(action)
 
         print(
-            f"Step {step + 1} | "
+            f"{i + 1:2d} | "
             f"Action {action} | "
-            f"Position "
-            f"({info['agent_x']}, "
+            f"Pos "
+            f"({info['agent_x']},"
             f"{info['agent_y']}) | "
             f"Collision "
             f"{info['collision']} | "
-            f"FirstVisit "
+            f"First "
             f"{info['first_visit']} | "
-            f"TileReward "
+            f"Tile "
             f"{info['tile_reward']:.1f} | "
             f"Reward "
-            f"{reward:.1f}"
+            f"{reward:.1f} | "
+            f"History "
+            f"{info['position_history']}"
         )
 
-        if terminated or truncated:
+        if (
+            terminated
+            or truncated
+        ):
             break
 
     env.close()

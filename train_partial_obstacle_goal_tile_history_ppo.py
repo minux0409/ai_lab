@@ -1,7 +1,7 @@
 from stable_baselines3 import PPO
 
-from partial_obstacle_map_reward_env import (
-    PartialObstacleMapRewardEnv,
+from partial_obstacle_goal_tile_history_env import (
+    PartialObstacleGoalTileHistoryEnv,
 )
 
 
@@ -15,15 +15,20 @@ CHECKPOINTS = [
 ]
 
 
-def evaluate_random(episodes=500):
-    env = PartialObstacleMapRewardEnv()
+def evaluate_random(
+    episodes=500,
+):
+    env = (
+        PartialObstacleGoalTileHistoryEnv()
+    )
 
     success = 0
-
     success_steps = []
     failure_steps = []
 
-    for episode in range(episodes):
+    for episode in range(
+        episodes
+    ):
         obs, _ = env.reset(
             seed=10_000 + episode
         )
@@ -45,9 +50,13 @@ def evaluate_random(episodes=500):
 
             steps += 1
 
-            if terminated or truncated:
+            if (
+                terminated
+                or truncated
+            ):
                 if terminated:
                     success += 1
+
                     success_steps.append(
                         steps
                     )
@@ -91,17 +100,19 @@ def evaluate(
     model,
     episodes=500,
 ):
-    env = PartialObstacleMapRewardEnv()
+    env = (
+        PartialObstacleGoalTileHistoryEnv()
+    )
 
     success = 0
-
     success_steps = []
     failure_steps = []
 
-    for episode in range(episodes):
-
-        # 모든 Checkpoint를
-        # 동일한 500개 맵으로 평가
+    for episode in range(
+        episodes
+    ):
+        # 이전 실험과 동일한
+        # 500개 평가 맵
         obs, _ = env.reset(
             seed=10_000 + episode
         )
@@ -109,9 +120,11 @@ def evaluate(
         steps = 0
 
         while True:
-            action, _ = model.predict(
-                obs,
-                deterministic=True,
+            action, _ = (
+                model.predict(
+                    obs,
+                    deterministic=True,
+                )
             )
 
             (
@@ -124,7 +137,10 @@ def evaluate(
 
             steps += 1
 
-            if terminated or truncated:
+            if (
+                terminated
+                or truncated
+            ):
                 if terminated:
                     success += 1
 
@@ -169,24 +185,24 @@ def evaluate(
 
 
 if __name__ == "__main__":
-
-    # -------------------------------------------------
-    # 실제 환경 설정값 확인
-    # -------------------------------------------------
     config_env = (
-        PartialObstacleMapRewardEnv()
+        PartialObstacleGoalTileHistoryEnv()
     )
 
     print(
-        "=== Goal Tile Reward Experiment ==="
+        "=== Goal Tile + "
+        "Short History Experiment ==="
     )
 
     print()
-    print("Observation       : 94")
+    print("Observation       : 107")
     print("  Local 3x3       : 9")
     print("  Goal dx/dy      : 2")
     print("  Discovered map  : 81")
     print("  Agent x/y       : 2")
+    print("  Last Action     : 4")
+    print("  Last Collision  : 1")
+    print("  Position History: 8")
 
     print()
     print(
@@ -218,9 +234,11 @@ if __name__ == "__main__":
     config_env.close()
 
     # -------------------------------------------------
-    # Random Agent
+    # Random
     # -------------------------------------------------
-    print("\n=== Random Agent ===")
+    print(
+        "\n=== Random Agent ==="
+    )
 
     (
         random_success,
@@ -241,7 +259,7 @@ if __name__ == "__main__":
     # PPO
     # -------------------------------------------------
     train_env = (
-        PartialObstacleMapRewardEnv()
+        PartialObstacleGoalTileHistoryEnv()
     )
 
     model = PPO(
@@ -264,7 +282,8 @@ if __name__ == "__main__":
         if additional_steps > 0:
             print(
                 f"\n"
-                f"{previous_checkpoint:,} → "
+                f"{previous_checkpoint:,} "
+                f"→ "
                 f"{checkpoint:,} "
                 f"timestep 학습..."
             )
@@ -306,17 +325,22 @@ if __name__ == "__main__":
         )
 
     # -------------------------------------------------
-    # 이번 실험 모델은 별도 이름으로 저장
+    # 별도 모델 저장
     # -------------------------------------------------
-    model.save(
+    MODEL_PATH = (
         "models/"
-        "partial_obstacle_goal_tile_reward_ppo"
+        "partial_obstacle_"
+        "goal_tile_history_ppo"
+    )
+
+    model.save(
+        MODEL_PATH
     )
 
     train_env.close()
 
     # -------------------------------------------------
-    # 최종 결과
+    # 결과
     # -------------------------------------------------
     print(
         "\n=== 전체 학습 결과 ==="
@@ -352,7 +376,7 @@ if __name__ == "__main__":
     print(
         "모델 저장:"
     )
+
     print(
-        "models/"
-        "partial_obstacle_goal_tile_reward_ppo.zip"
+        MODEL_PATH + ".zip"
     )
